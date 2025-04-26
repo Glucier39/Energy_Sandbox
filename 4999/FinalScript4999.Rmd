@@ -1,0 +1,308 @@
+Geddy Lucier
+PSCI4999 Final Script
+Electricity Price Predictions:
+
+```{r}
+library(tidyverse)
+library(stargazer)
+library(xgboost)
+library(lubridate)
+library(readr)
+library(riem)
+library(stringr)
+library(gmodels)
+library(caret)
+library(data.table)
+library(nnet)
+library(rpart)
+library(NeuralNetTools)
+library(neuralnet)
+
+```
+Data Read In 
+```{r}
+#4/20/24 is start date 
+phl_da <- read_csv("https://raw.githubusercontent.com/Glucier39/Energy_Sandbox/refs/heads/main/4999/data/da_hrl_lmps.csv")
+
+phl_loads <- read_csv("https://raw.githubusercontent.com/Glucier39/Energy_Sandbox/refs/heads/main/4999/data/hrl_load_metered.csv") 
+ 
+#zone_agg <- rbind(zones24, zones25)
+
+phl_intersect <- intersect(phl_da$datetime_beginning_ept, phl_loads$datetime_beginning_ept)
+
+phl_da <- phl_da %>% filter(datetime_beginning_ept %in% phl_intersect) # %>% select(-datetime_beginning_utc, -datetime_beginning_ept)
+phl_loads <- phl_loads %>% filter(datetime_beginning_ept %in% phl_intersect) %>% select(mw)
+
+phl_agg <- cbind(phl_da, phl_loads)
+
+
+phl_agg$date_raw <- substr(phl_agg$datetime_beginning_ept, 1, 9)
+####################################################################
+
+# Look up PHL
+stations <- riem_stations("PA_ASOS")  # Returns stations in Pennsylvania
+stations[grep("PHL", stations$id), ]
+
+# Download data
+phl_weather <- riem_measures(
+  station = "PHL", 
+  date_start = "2024-04-20", 
+  date_end = "2025-04-20"
+) 
+
+phl_weather$date_raw <- substr(phl_weather$valid, 1, 10)
+phl_weather$date_raw <- str_replace_all(phl_weather$date_raw, "-", "/") 
+phl_weather_clean <- phl_weather %>% 
+  distinct(date_raw, .keep_all = TRUE) 
+
+phl_weather_clean <- phl_weather_clean %>%
+  mutate(date_raw = format(as.Date(date_raw, format = "%Y/%m/%d"), "%m/%d/%Y")) %>%
+  mutate(date_raw = sub("^0", "", date_raw),            # remove leading 0 from month
+         date_raw = sub("/0", "/", date_raw))           # remove leading 0 from day
+
+phl_agg <- phl_agg %>% dplyr::select(datetime_beginning_ept, pnode_name, total_lmp_da, congestion_price_da, marginal_loss_price_da, mw, date_raw) 
+
+
+
+phl_weather_clean <- phl_weather_clean %>% 
+  dplyr::select(-valid) %>% mutate(date_raw = as.character(date_raw))
+
+phl_agg <- phl_agg %>% mutate(date_raw = as.Date(date_raw, format = "%m/%d/%Y"))# needs to be done last one merging is completed
+
+phl_agg <- phl_agg %>%
+  mutate(day_of_year = yday(date_raw))
+
+
+phl_weather_clean <- phl_weather_clean %>% mutate(date_raw = as.Date(date_raw, format = "%m/%d/%Y"))# needs to be done last one merging is completed
+
+phl_weather_clean <- phl_weather_clean %>%
+  mutate(day_of_year = yday(date_raw))
+
+phl_tot <- left_join(phl_agg, phl_weather_clean, by = "day_of_year") 
+
+phl_tot <- phl_tot %>% dplyr::select(datetime_beginning_ept, day_of_year, total_lmp_da, congestion_price_da, marginal_loss_price_da, mw, tmpf, dwpf, relh)
+
+
+```
+Renwable Mix 
+```{r}
+solar <- read_csv("https://raw.githubusercontent.com/Glucier39/Energy_Sandbox/refs/heads/main/4999/data/solar_gen.csv") 
+wind <- read_csv("https://raw.githubusercontent.com/Glucier39/Energy_Sandbox/7ad8d913af08a482a3c6bb01f90582b1c6904f01/4999/data/wind_gen.csv") 
+
+solar <- solar %>% filter(area == "MIDATL") %>% dplyr::select(solar_generation_mw)
+
+
+renewable <- cbind(solar, wind)
+
+intr <- intersect(phl_tot$datetime_beginning_ept, renewable$datetime_beginning_ept)
+
+renewable <- renewable %>% filter(datetime_beginning_ept %in% intr) %>% dplyr::select(wind_generation_mw, solar_generation_mw)
+
+phl_tot <- cbind(phl_tot, renewable) # factor in renwable energy generation 
+
+phl_tot <- data.table(phl_tot)
+
+# Create shifted future price (1 day ahead) for total_lmp_da
+phl_tot[, FutureLMP := shift(total_lmp_da, 24, type = "lead")] # 24 rows ahead - is it predictive 
+
+# Calculate % gain from current to future price
+phl_tot[, FutureLMP_PercentGain := ((FutureLMP - total_lmp_da) / total_lmp_da) * 100]
+
+# Create binary outcome: 1 if future price is higher than current, else 0
+phl_tot[, FutureLMP_Outcome := ifelse(FutureLMP > total_lmp_da, 1, 0)]
+
+phl_tot$day_of_year <- as.numeric(phl_tot$day_of_year)
+
+phl_tot <- phl_tot %>% select(-datetime_beginning_ept, -FutureLMP_PercentGain, -FutureLMP) # so only features are still present
+
+#final cleaning steps 
+phl_tot<-data.frame(phl_tot)
+
+phl_tot <- phl_tot[complete.cases(phl_tot), ]
+
+
+#write_csv(phl_tot, file = "Documents/GitHub/Energy_Sandbox/4999/phl_tot_electricity.csv")
+```
+
+
+XGBOOST model 
+```{r}
+set.seed(150)
+index <- createDataPartition(phl_tot$FutureLMP_Outcome, p=0.8, list=FALSE)
+        train_DecisionDT <- phl_tot[index, ]
+        test_DecisionDT <- phl_tot[-index, ]
+        
+FeaturesToUse<-setdiff(names(train_DecisionDT),"FutureLMP_Outcome")
+
+X <- as.matrix(train_DecisionDT[, FeaturesToUse])
+y <- train_DecisionDT$FutureLMP_Outcome
+
+Xtest <- as.matrix(test_DecisionDT[, FeaturesToUse])
+ytest <- test_DecisionDT$FutureLMP_Outcome
+  
+  
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+params <- list(
+  objective = "binary:logistic",  # for binary classification
+  eval_metric = "logloss",        # evaluation metric
+  max_depth = 6,                  # tree depth (you can adjust this)
+  eta = 0.1                       # learning rate
+)
+
+nrounds <- 1000  # number of boosting rounds
+
+watchlist <- list(train = dtrain)
+bst <- xgb.train(params = params, data = dtrain, nrounds = nrounds,
+                 watchlist = watchlist, verbose = 0)
+
+# Get predicted probabilities
+pred_probs <- predict(bst, newdata = Xtest)
+
+# Convert probabilities to binary class predictions
+pred_labels <- ifelse(pred_probs > 0.5, 1, 0)
+
+xg_confusion <- confusionMatrix(
+  factor(pred_labels, levels = c(0, 1)),
+  factor(ytest, levels = c(0, 1))
+)
+
+xg_confusion
+```
+
+```{r}
+eval_log <- bst$evaluation_log
+
+p_eval <- plot_ly(data = eval_log,
+                  x = ~iter,
+                  y = ~train_logloss,
+                  type = 'scatter',
+                  mode = 'lines+markers') %>%
+  layout(title = "Training Logloss over Boosting Iterations",
+         xaxis = list(title = "Iteration"),
+         yaxis = list(title = "Logloss"))
+
+# Display the plot
+p_eval
+library(DiagrammeR)
+
+tree_plot <- xgb.plot.tree(model = bst, trees = 0)
+
+# Convert the DiagrammeR graph to an SVG string...
+svg_str <- DiagrammeRsvg::export_svg(tree_plot)
+
+# ...then convert the SVG to a PNG saved in a temporary file.
+tmp_file <- tempfile(fileext = ".png")
+rsvg::rsvg_png(charToRaw(svg_str), tmp_file)
+
+# Convert the PNG file to a base64 URI for embedding into a plotly image trace.
+img_uri <- base64enc::dataURI(file = tmp_file, mime = "image/png")
+
+# Create a plotly figure that shows the tree image.
+p_tree <- plot_ly() %>%
+  layout(title = "Visualization of the First Tree from XGBoost Model",
+         images = list(
+           list(
+             source = img_uri,
+             x = 0, y = 1,
+             sizex = 1, sizey = 1,
+             xref = "x",
+             yref = "y",
+             sizing = "contain",
+             opacity = 1,
+             layer = "above"
+           )
+         ),
+         xaxis = list(visible = FALSE),
+         yaxis = list(visible = FALSE))
+         
+# Display the tree plot
+p_tree
+```
+NN  Scaling
+
+```{r}
+train_NN_DF<-data.frame(train_DecisionDT) # train off same dataset 
+
+test_NN_DF<-data.frame(test_DecisionDT[,FeaturesToUse]) # test on same dataset
+
+test_nn_outcome <- test_DecisionDT$FutureLMP_Outcome # make an outcome 
+
+train_NN_DF$FutureLMP_Outcome <- as.numeric(as.character(train_NN_DF$FutureLMP_Outcome))
+
+FeaturesToUse <- c(
+  "day_of_year",
+  "mw",
+  "tmpf",
+  "dwpf",
+  "relh",
+  "wind_generation_mw",
+  "solar_generation_mw"
+)
+
+scale_minmax <- function(train_col, test_col) {
+  min_val <- min(train_col, na.rm = TRUE)
+  max_val <- max(train_col, na.rm = TRUE)
+  train_scaled <- (train_col - min_val) / (max_val - min_val)
+  test_scaled  <- (test_col  - min_val) / (max_val - min_val)
+  return(list(train = train_scaled, test = test_scaled))
+}
+
+for (feat in FeaturesToUse) {
+  scaled <- scale_minmax(train_NN_DF[[feat]], test_NN_DF[[feat]])
+  train_NN_DF[[feat]] <- scaled$train
+  test_NN_DF[[feat]]  <- scaled$test
+}
+
+
+nn_model <- neuralnet(
+  FutureLMP_Outcome ~ day_of_year + mw + tmpf + dwpf + relh + wind_generation_mw + solar_generation_mw,
+  data = train_NN_DF,
+  hidden = 5,
+  act.fct = "logistic",
+  linear.output = FALSE,
+  stepmax = 1e7, # accuracy controls
+  threshold = 0.001,
+  lifesign = "minimal"
+)
+
+pred_probs <- predict(nn_model, test_NN_DF)
+pred_class <- ifelse(pred_probs > 0.5, 1, 0)
+
+Up_Predicted<-factor(pred_class,c(1,0))
+Up_Outcome<-factor(test_nn_outcome,c(1,0))
+
+confusionMatrix(Up_Predicted, Up_Outcome)
+
+
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+nnconf_table <- as.data.frame.matrix(nn_confusion$table)
+stargazer(nnconf_table, type = "html", title = "Confusion Matrix", summary = FALSE)
+
+
+stargazer(
+  nnconf_table,
+  type = "html",
+  title = "Neural Network Confusion Matrix",
+  summary = FALSE,
+  out = "~/Documents/GitHub/Energy_Sandbox/4999/outputs/nn_conf_matrix.html"
+)
+
+```
+
+
+
+
+
+
