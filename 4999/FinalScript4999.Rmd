@@ -261,9 +261,9 @@ nn_model <- neuralnet(
   hidden = 5,
   act.fct = "logistic",
   linear.output = FALSE,
-  stepmax = 1e7, # accuracy controls
+  stepmax = 2e6, # accuracy controls
   threshold = 0.001,
-  lifesign = "minimal"
+  lifesign = "full" # details 
 )
 
 pred_probs <- predict(nn_model, test_NN_DF)
@@ -273,6 +273,7 @@ Up_Predicted<-factor(pred_class,c(1,0))
 Up_Outcome<-factor(test_nn_outcome,c(1,0))
 
 confusionMatrix(Up_Predicted, Up_Outcome)
+
 
 
 
