@@ -17,7 +17,10 @@ library(nnet)
 library(rpart)
 library(NeuralNetTools)
 library(neuralnet)
-
+library(ggplot2)
+library(reshape2)
+library(plotly)
+library(glmnet)
 ```
 Data Read In 
 ```{r}
@@ -113,7 +116,7 @@ phl_tot[, FutureLMP_Outcome := ifelse(FutureLMP > total_lmp_da, 1, 0)]
 
 phl_tot$day_of_year <- as.numeric(phl_tot$day_of_year)
 
-phl_tot <- phl_tot %>% select(-datetime_beginning_ept, -FutureLMP_PercentGain, -FutureLMP) # so only features are still present
+phl_tot <- phl_tot %>% select(-datetime_beginning_ept, -FutureLMP_PercentGain, -FutureLMP, -congestion_price_da, -marginal_loss_price_da,) # so only features are still present
 
 #final cleaning steps 
 phl_tot<-data.frame(phl_tot)
@@ -146,13 +149,14 @@ dtrain <- xgb.DMatrix(data = X, label = y)
 params <- list(
   objective = "binary:logistic",  # for binary classification
   eval_metric = "logloss",        # evaluation metric
-  max_depth = 6,                  # tree depth (you can adjust this)
+  max_depth = 4,                  # tree depth (you can adjust this)
   eta = 0.1                       # learning rate
 )
 
 nrounds <- 1000  # number of boosting rounds
 
-watchlist <- list(train = dtrain)
+watchlist <- list(train = dtrain) 
+set.seed(130)
 bst <- xgb.train(params = params, data = dtrain, nrounds = nrounds,
                  watchlist = watchlist, verbose = 0)
 
@@ -169,6 +173,141 @@ xg_confusion <- confusionMatrix(
 
 xg_confusion
 ```
+```{r}
+# Step 1: Set up features (X) and outcome (y)
+train_x <- as.matrix(train_DecisionDT[, c("total_lmp_da", "day_of_year", "mw", "tmpf", "dwpf", "relh", "wind_generation_mw", "solar_generation_mw")])
+train_y <- train_DecisionDT$FutureLMP_Outcome
+
+test_x <- as.matrix(test_DecisionDT[, c("total_lmp_da", "day_of_year", "mw", "tmpf", "dwpf", "relh", "wind_generation_mw", "solar_generation_mw")])
+test_y <- test_DecisionDT$FutureLMP_Outcome
+
+# Step 2: Cross-validate to find best lambda
+set.seed(100)  # For reproducibility
+cv_lasso <- cv.glmnet(train_x, train_y, alpha = 1, family = "binomial")
+
+# Best lambda value
+best_lambda <- cv_lasso$lambda.min
+
+# Step 3: Train final Lasso model with best lambda
+lasso_model <- glmnet(train_x, train_y, alpha = 1, family = "binomial", lambda = best_lambda)
+
+# Step 4: Make predictions on test set
+# Get predicted probabilities
+pred_probs <- predict(lasso_model, newx = test_x, type = "response")
+
+# Turn probabilities into 0/1 predictions (threshold at 0.5)
+pred_classes <- ifelse(pred_probs > 0.5, 1, 0)
+
+# Step 5: Evaluate
+confusionMatrix(factor(pred_classes), factor(test_y))
+
+
+
+
+```
+
+```{r}
+coef_lasso <- coef(lasso_model)
+coef_df <- as.data.frame(as.matrix(coef_lasso))
+coef_df$Feature <- rownames(coef_df)
+colnames(coef_df) <- c("Coefficient", "Feature")
+
+# Filter out zero coefficients and intercept
+coef_df <- coef_df %>% filter(Coefficient != 0, Feature != "(Intercept)")
+
+# Plot
+ggplot(coef_df, aes(x = Coefficient, y = reorder(Feature, Coefficient))) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Lasso Coefficient Plot", 
+       x = "Coefficient Estimate", 
+       y = "Feature") +
+  theme_minimal(base_size = 14)
+
+```
+```{r}
+importance_matrix <- xgb.importance(model = bst)
+# Plot importance
+xgb.plot.importance(importance_matrix, top_n = 10)
+importance_df <- as.data.frame(importance_matrix)
+
+# Plot using ggplot
+ggplot(importance_df, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "XGBoost Feature Importance (by Gain)", 
+       x = "Feature", 
+       y = "Importance (Gain)") +
+  theme_minimal(base_size = 14)
+```
+
+
+NN  Scaling
+
+```{r}
+train_NN_DF<-data.frame(train_DecisionDT) # train off same dataset 
+
+test_NN_DF<-data.frame(test_DecisionDT[,FeaturesToUse]) # test on same dataset
+
+test_nn_outcome <- test_DecisionDT$FutureLMP_Outcome # make an outcome 
+
+train_NN_DF$FutureLMP_Outcome <- as.numeric(as.character(train_NN_DF$FutureLMP_Outcome))
+
+FeaturesToUse <- c(
+  "day_of_year",
+  "mw",
+  "tmpf",
+  "dwpf",
+  "relh",
+  "wind_generation_mw",
+  "solar_generation_mw", 
+  "total_lmp_da"
+)
+
+scale_minmax <- function(train_col, test_col) {
+  min_val <- min(train_col, na.rm = TRUE)
+  max_val <- max(train_col, na.rm = TRUE)
+  train_scaled <- (train_col - min_val) / (max_val - min_val)
+  test_scaled  <- (test_col  - min_val) / (max_val - min_val)
+  return(list(train = train_scaled, test = test_scaled))
+}
+
+for (feat in FeaturesToUse) {
+  scaled <- scale_minmax(train_NN_DF[[feat]], test_NN_DF[[feat]])
+  train_NN_DF[[feat]] <- scaled$train
+  test_NN_DF[[feat]]  <- scaled$test
+}
+
+
+nn_model <- neuralnet(
+  FutureLMP_Outcome ~ total_lmp_da + day_of_year + mw + tmpf + dwpf + relh + wind_generation_mw + solar_generation_mw,
+  data = train_NN_DF,
+  hidden = 5,
+  act.fct = "logistic",
+  linear.output = FALSE,
+  stepmax = 2e6, # accuracy controls
+  threshold = 0.001,
+  lifesign = "full" # details 
+)
+
+pred_probs <- predict(nn_model, test_NN_DF)
+pred_class <- ifelse(pred_probs > 0.5, 1, 0)
+
+Up_Predicted<-factor(pred_class,c(1,0))
+Up_Outcome<-factor(test_nn_outcome,c(1,0))
+
+nn_confusion <- confusionMatrix(Up_Predicted, Up_Outcome)
+
+
+#saveRDS(nn_model, file = "nn_model.rds")
+#nn_model <- readRDS(file = "nn_model.rds")
+plot(nn_model)
+nn_confusion
+```
+
+
+
+
 
 ```{r}
 eval_log <- bst$evaluation_log
@@ -177,10 +316,12 @@ p_eval <- plot_ly(data = eval_log,
                   x = ~iter,
                   y = ~train_logloss,
                   type = 'scatter',
-                  mode = 'lines+markers') %>%
-  layout(title = "Training Logloss over Boosting Iterations",
-         xaxis = list(title = "Iteration"),
-         yaxis = list(title = "Logloss"))
+                  mode = 'lines+markers')
+
+p_eval <- layout(p_eval,
+                 title = "Training Logloss over Boosting Iterations",
+                 xaxis = list(title = "Iteration"),
+                 yaxis = list(title = "Logloss"))
 
 # Display the plot
 p_eval
@@ -200,7 +341,7 @@ img_uri <- base64enc::dataURI(file = tmp_file, mime = "image/png")
 
 # Create a plotly figure that shows the tree image.
 p_tree <- plot_ly() %>%
-  layout(title = "Visualization of the First Tree from XGBoost Model",
+  layout(title = "XGBoost Model Tree",
          images = list(
            list(
              source = img_uri,
@@ -218,87 +359,57 @@ p_tree <- plot_ly() %>%
          
 # Display the tree plot
 p_tree
+
+importance_matrix <- xgb.importance(model = bst)
+
+# View top variables
+print(importance_matrix)
+
+# Plot importance nicely
+
 ```
-NN  Scaling
-
 ```{r}
-train_NN_DF<-data.frame(train_DecisionDT) # train off same dataset 
-
-test_NN_DF<-data.frame(test_DecisionDT[,FeaturesToUse]) # test on same dataset
-
-test_nn_outcome <- test_DecisionDT$FutureLMP_Outcome # make an outcome 
-
-train_NN_DF$FutureLMP_Outcome <- as.numeric(as.character(train_NN_DF$FutureLMP_Outcome))
-
-FeaturesToUse <- c(
-  "day_of_year",
-  "mw",
-  "tmpf",
-  "dwpf",
-  "relh",
-  "wind_generation_mw",
-  "solar_generation_mw"
-)
-
-scale_minmax <- function(train_col, test_col) {
-  min_val <- min(train_col, na.rm = TRUE)
-  max_val <- max(train_col, na.rm = TRUE)
-  train_scaled <- (train_col - min_val) / (max_val - min_val)
-  test_scaled  <- (test_col  - min_val) / (max_val - min_val)
-  return(list(train = train_scaled, test = test_scaled))
-}
-
-for (feat in FeaturesToUse) {
-  scaled <- scale_minmax(train_NN_DF[[feat]], test_NN_DF[[feat]])
-  train_NN_DF[[feat]] <- scaled$train
-  test_NN_DF[[feat]]  <- scaled$test
-}
 
 
-nn_model <- neuralnet(
-  FutureLMP_Outcome ~ day_of_year + mw + tmpf + dwpf + relh + wind_generation_mw + solar_generation_mw,
-  data = train_NN_DF,
-  hidden = 5,
-  act.fct = "logistic",
-  linear.output = FALSE,
-  stepmax = 2e6, # accuracy controls
-  threshold = 0.001,
-  lifesign = "full" # details 
-)
-
-pred_probs <- predict(nn_model, test_NN_DF)
-pred_class <- ifelse(pred_probs > 0.5, 1, 0)
-
-Up_Predicted<-factor(pred_class,c(1,0))
-Up_Outcome<-factor(test_nn_outcome,c(1,0))
-
-confusionMatrix(Up_Predicted, Up_Outcome)
+top_features <- importance_matrix[1:8, ]
+top_features_long <- top_features %>%
+  pivot_longer(cols = c(Gain, Cover, Frequency),
+               names_to = "Metric",
+               values_to = "Value")
 
 
-
-
+ggplot(top_features_long, aes(x = reorder(Feature, Value), y = Value, fill = Metric)) +
+  geom_col(position = "stack") +  # <-- STACK instead of dodge
+  coord_flip() +
+  labs(title = "XGBOOST Feature Importance Metrics",
+       x = "Feature",
+       y = "Combined Value",
+       fill = "Metric") +
+  theme_minimal(base_size = 14)
 ```
 
 
-
-
-
-
-
-
-
 ```{r}
-nnconf_table <- as.data.frame.matrix(nn_confusion$table)
-stargazer(nnconf_table, type = "html", title = "Confusion Matrix", summary = FALSE)
+nn_table <- as.table(nn_confusion$table)
+cm_melted <- melt(cm_table)
+colnames(cm_melted) <- c("Reference", "Prediction", "Count")
 
+ggplot(data = cm_melted, aes(x = Reference, y = Prediction, fill = Count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Count), color = "black", size = 5) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = "Confusion Matrix", x = "Actual Class", y = "Predicted Class") +
+  theme_minimal(base_size = 15) + labs(x = "True Class (Actual)", y = "Predicted Class", fill = "Count")
 
-stargazer(
-  nnconf_table,
-  type = "html",
-  title = "Neural Network Confusion Matrix",
-  summary = FALSE,
-  out = "~/Documents/GitHub/Energy_Sandbox/4999/outputs/nn_conf_matrix.html"
-)
+# Plot using ggplot
+ggplot(top_features, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "XGBoost Feature Importance (by Gain)",
+       x = "Feature",
+       y = "Importance (Gain)") +
+  theme_minimal(base_size = 14)
+```
 
 ```
 
