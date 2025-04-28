@@ -1,0 +1,9 @@
+title,Primary Forest loss in Ghana
+threshold,30
+extent_year,2000
+forest_type,primary_forest
+start_year,2002
+end_year,2023
+date_downloaded,2025-04-27
+metadata,https://api.resourcewatch.org/v1/gfw-metadata/widget_primary_forest_loss
+link,https://www.globalforestwatch.org/dashboards/country/GHA/?category=forest-change&location=WyJjb3VudHJ5IiwiR0hBIl0%3D&map=eyJjYW5Cb3VuZCI6dHJ1ZX0%3D
