@@ -242,69 +242,6 @@ ggplot(importance_df, aes(x = reorder(Feature, Gain), y = Gain)) +
 ```
 
 
-NN  Scaling
-
-```{r}
-train_NN_DF<-data.frame(train_DecisionDT) # train off same dataset 
-
-test_NN_DF<-data.frame(test_DecisionDT[,FeaturesToUse]) # test on same dataset
-
-test_nn_outcome <- test_DecisionDT$FutureLMP_Outcome # make an outcome 
-
-train_NN_DF$FutureLMP_Outcome <- as.numeric(as.character(train_NN_DF$FutureLMP_Outcome))
-
-FeaturesToUse <- c(
-  "day_of_year",
-  "mw",
-  "tmpf",
-  "dwpf",
-  "relh",
-  "wind_generation_mw",
-  "solar_generation_mw", 
-  "total_lmp_da"
-)
-
-scale_minmax <- function(train_col, test_col) {
-  min_val <- min(train_col, na.rm = TRUE)
-  max_val <- max(train_col, na.rm = TRUE)
-  train_scaled <- (train_col - min_val) / (max_val - min_val)
-  test_scaled  <- (test_col  - min_val) / (max_val - min_val)
-  return(list(train = train_scaled, test = test_scaled))
-}
-
-for (feat in FeaturesToUse) {
-  scaled <- scale_minmax(train_NN_DF[[feat]], test_NN_DF[[feat]])
-  train_NN_DF[[feat]] <- scaled$train
-  test_NN_DF[[feat]]  <- scaled$test
-}
-
-
-nn_model <- neuralnet(
-  FutureLMP_Outcome ~ total_lmp_da + day_of_year + mw + tmpf + dwpf + relh + wind_generation_mw + solar_generation_mw,
-  data = train_NN_DF,
-  hidden = 5,
-  act.fct = "logistic",
-  linear.output = FALSE,
-  stepmax = 2e6, # accuracy controls
-  threshold = 0.001,
-  lifesign = "full" # details 
-)
-
-pred_probs <- predict(nn_model, test_NN_DF)
-pred_class <- ifelse(pred_probs > 0.5, 1, 0)
-
-Up_Predicted<-factor(pred_class,c(1,0))
-Up_Outcome<-factor(test_nn_outcome,c(1,0))
-
-nn_confusion <- confusionMatrix(Up_Predicted, Up_Outcome)
-
-
-#saveRDS(nn_model, file = "nn_model.rds")
-#nn_model <- readRDS(file = "nn_model.rds")
-plot(nn_model)
-nn_confusion
-```
-
 
 
 
@@ -368,6 +305,8 @@ print(importance_matrix)
 # Plot importance nicely
 
 ```
+
+
 ```{r}
 
 
@@ -386,31 +325,6 @@ ggplot(top_features_long, aes(x = reorder(Feature, Value), y = Value, fill = Met
        y = "Combined Value",
        fill = "Metric") +
   theme_minimal(base_size = 14)
-```
-
-
-```{r}
-nn_table <- as.table(nn_confusion$table)
-cm_melted <- melt(cm_table)
-colnames(cm_melted) <- c("Reference", "Prediction", "Count")
-
-ggplot(data = cm_melted, aes(x = Reference, y = Prediction, fill = Count)) +
-  geom_tile(color = "white") +
-  geom_text(aes(label = Count), color = "black", size = 5) +
-  scale_fill_gradient(low = "lightblue", high = "darkblue") +
-  labs(title = "Confusion Matrix", x = "Actual Class", y = "Predicted Class") +
-  theme_minimal(base_size = 15) + labs(x = "True Class (Actual)", y = "Predicted Class", fill = "Count")
-
-# Plot using ggplot
-ggplot(top_features, aes(x = reorder(Feature, Gain), y = Gain)) +
-  geom_col(fill = "steelblue") +
-  coord_flip() +
-  labs(title = "XGBoost Feature Importance (by Gain)",
-       x = "Feature",
-       y = "Importance (Gain)") +
-  theme_minimal(base_size = 14)
-```
-
 ```
 
 
