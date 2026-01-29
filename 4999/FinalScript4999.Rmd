@@ -173,6 +173,8 @@ xg_confusion <- confusionMatrix(
 
 xg_confusion
 ```
+
+
 ```{r}
 # Step 1: Set up features (X) and outcome (y)
 train_x <- as.matrix(train_DecisionDT[, c("total_lmp_da", "day_of_year", "mw", "tmpf", "dwpf", "relh", "wind_generation_mw", "solar_generation_mw")])

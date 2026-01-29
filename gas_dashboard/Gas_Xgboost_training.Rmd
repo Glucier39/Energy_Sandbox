@@ -1,0 +1,520 @@
+Geddy Lucier Correlation Testing + Tidyquant
+
+```{r}
+library(quantmod)
+library(caret)
+library(tidyverse)
+library(riem)
+library(tidyquant)
+library(xgboost)
+```
+
+```{r}
+crude_stock <- read_csv("/Users/geddylucier/Documents/GitHub/Energy_Sandbox/gas_dashboard/crude_stockdata.csv")
+distilate_stock <- read_csv("/Users/geddylucier/Documents/GitHub/Energy_Sandbox/gas_dashboard/distilate_stock.csv")
+gas_stock <- read_csv("/Users/geddylucier/Documents/GitHub/Energy_Sandbox/gas_dashboard/gas_stocks.csv")
+
+stocks_df = left_join(crude_stock, distilate_stock, by = c("Week" = "week")) 
+stocks_df = left_join(stocks_df, gas_stock,  by = c("Week" = "week"))
+
+head(stocks_df,10)
+
+nyc_gas <- tq_get("DGASUSGULF", get = "economic.data")
+gulf_gas <- tq_get("DGASUSGULF", get = "economic.data")
+
+nyc_gas %>%
+  ggplot(aes(x = date, y = price)) +
+  geom_line(color = "blue") +
+  labs(title = "NY Harbor Gasoline Spot Price",
+       y = "Dollars per Gallon",
+       x = "Date")
+
+wti_crude <- tq_get("DCOILWTICO", get = "economic.data") # crude prices
+
+
+com_join = left_join(nyc_gas, wti_crude, by = "date")
+
+summary(lm(price.x ~ price.y, data = com_join))
+
+stations <- riem_stations("TX_ASOS")  # Returns stations in Pennsylvania
+stations[grep("TX", stations$id), ]
+
+# Download data
+houston <- riem_measures(
+  station = "IAH",  # Houston Intercontinental
+  date_start = "2016-01-01",
+  date_end = Sys.Date()
+)
+
+
+com_join %>%
+  ggplot(aes(x = price.x, y = price.y)) +
+  geom_line(color = "blue") + 
+  geom_smooth(method = lm)
+
+```
+
+Feature engineering
+
+```{r}
+houston <- houston %>%
+  mutate(
+    # Extract date from valid timestamp
+    date = as.Date(valid),
+    
+    # Convert temperature (tmpf is in Fahrenheit)
+    temp_f = tmpf,
+    
+    # Convert precipitation (p01i is in inches)
+    precip_inches = p01i,
+    
+    # Wind speed (sknt is in knots)
+    wind_knots = sknt
+  )
+
+weather_daily <- houston %>%
+  group_by(date) %>%
+  summarise(
+    # === TEMPERATURE ===
+    temp_max = max(temp_f, na.rm = TRUE),
+    temp_min = min(temp_f, na.rm = TRUE),
+    temp_avg = mean(temp_f, na.rm = TRUE),
+    
+    # === PRECIPITATION ===
+    precip_total = sum(precip_inches, na.rm = TRUE),
+    precip_max_hourly = max(precip_inches, na.rm = TRUE),
+    
+    # === WIND ===
+    wind_max = max(wind_knots, na.rm = TRUE),
+    wind_avg = mean(wind_knots, na.rm = TRUE),
+    
+    # === HUMIDITY ===
+    humidity_avg = mean(relh, na.rm = TRUE),
+    
+    # === PRESSURE ===
+    pressure_avg = mean(mslp, na.rm = TRUE),
+    
+    # Count of observations (data quality check)
+    n_obs = n()
+  ) %>%
+  arrange(date) %>%
+  # Handle infinite values from max() on empty sets
+  mutate(across(where(is.numeric), ~ifelse(is.infinite(.), NA, .)))
+
+
+```
+
+```{r}
+stocks_df <- stocks_df %>%
+  mutate(date = mdy(Week),
+         iso_week = isoweek(date),
+         year = year(date)) %>%
+  select(date, crude_stocks, distilate_stock, gas_stocks, iso_week, year)
+
+wti_crude <- wti_crude %>%
+   mutate(date = as.Date(date),
+         iso_week = isoweek(date),
+         year = year(date)) %>%  # Add year too!
+  select(date, price, iso_week, year) %>%  # Keep iso_week and year
+  arrange(date) 
+
+# Your price data (daily)
+gulf_gas <- gulf_gas %>%
+  mutate(date = as.Date(date),
+         iso_week = isoweek(date),
+         year = year(date)) %>%  # Add year too!
+  select(date, price, iso_week, year) %>%  # Keep iso_week and year
+  arrange(date)
+
+
+  
+
+full_data <- gulf_gas %>%
+  left_join(stocks_df, by = c("iso_week", "year")) %>%
+  select(date = date.x, price, crude_stocks, distilate_stock, gas_stocks, year) %>%
+  arrange(date) %>%
+  filter(!is.na(crude_stocks)) %>%
+  filter(!is.na(price)) %>%
+  left_join(weather_daily, by = "date")
+
+
+full_data
+```
+
+```{r}
+full_data %>% filter(year == "2020") %>%
+  ggplot(aes(x = date, y = price)) + geom_line()
+
+summary(lm(price ~ crude_stocks + distilate_stock + gas_stocks, data = full_data))
+years_act = c("2022", "2023", "2024", "2025")
+
+# Feature engineering 
+model_data <- full_data %>%
+  arrange(date) %>%
+  mutate(
+    price_lag1 = lag(price, 1),
+    price_lag3 = lag(price, 3),
+    price_lag7 = lag(price, 7), # Price Lag info
+    
+    gas_lag7 = lag(gas_stocks, 7), 
+    crude_lag7 = lag(crude_stocks, 7),
+    distillate_lag7 = lag(distilate_stock,7), #Does lagged (last week's storage)
+    #impact price?
+    
+    month = as.factor(month(date)),
+    is_summer = as.numeric(month %in% c(5, 6, 7, 8)),
+    is_hurricane = as.numeric(month %in% c(8, 9, 10)),
+    
+    #Weather lags - deos weather impact price
+    
+    temp_avg_lag1 = lag(temp_avg, 1),
+    temp_avg_lag7 = lag(temp_avg, 7),
+    temp_avg_lag30 = lag(temp_avg, 30),
+    
+    temp_max_lag1 = lag(temp_max, 1),
+    temp_max_lag7 = lag(temp_max, 7),
+    temp_max_lag30 = lag(temp_max, 30),
+    
+    temp_min_lag1 = lag(temp_min, 1),
+    temp_min_lag7 = lag(temp_min, 7),
+    temp_min_lag30 = lag(temp_min, 30),
+  ) %>%
+  na.omit() %>% filter(year %in% years_act)
+
+summary(lm(price ~ price_lag1 + price_lag7 + distillate_lag7 + crude_lag7 + gas_lag7, data = model_data))
+
+summary(lm(price ~ month +distillate_lag7 + gas_lag7, data = model_data))
+
+summary(lm(
+  price ~ temp_avg_lag1 + temp_avg_lag7 + temp_avg_lag30 +
+                 temp_max_lag1 + temp_max_lag7 + temp_max_lag30 +
+                 temp_min_lag1 + temp_min_lag7 + temp_min_lag30 +
+                 gas_lag7 + crude_lag7 + distillate_lag7 + month,
+  data = model_data
+))
+
+```
+
+Walk Forward Implementation
+
+```{r}
+# Parameters
+train_window <- 365  # Days to train on
+test_window <- 30    # Days to test on
+min_train_date <- as.Date("2017-01-01")  # Start after you have enough data
+
+# Feature columns
+features <- c(
+  "price_lag1", "price_lag3", "price_lag7",
+  "gas_lag7", "crude_lag7", "distillate_lag7",
+  "temp_avg_lag1", "temp_avg_lag7",
+  "temp_max_lag1", "temp_min_lag1",
+  "is_summer", "is_hurricane"
+)
+
+# Initialize results storage
+walk_forward_results <- list()
+
+# Get unique dates
+all_dates <- sort(unique(model_data$date))
+start_idx <- which(all_dates >= min_train_date)[1]
+
+```
+
+```{r}
+fold <- 1
+for (i in seq(start_idx + train_window, length(all_dates) - test_window, by = test_window)) {
+  
+  # Define train and test date ranges
+  train_end_date <- all_dates[i]
+  train_start_date <- all_dates[max(1, i - train_window)]
+  test_start_date <- all_dates[i + 1]
+  test_end_date <- all_dates[min(i + test_window, length(all_dates))]
+  
+  # Split data
+  train_fold <- model_data %>% 
+    filter(date >= train_start_date & date <= train_end_date)
+  
+  test_fold <- model_data %>% 
+    filter(date >= test_start_date & date <= test_end_date)
+  
+  # Skip if not enough data
+  if (nrow(train_fold) < 100 | nrow(test_fold) < 5) {
+    next
+  }
+  
+  # Prepare matrices
+  X_train <- as.matrix(train_fold[, features])
+  y_train <- train_fold$price
+  
+  X_test <- as.matrix(test_fold[, features])
+  y_test <- test_fold$price
+  
+  # Train XGBoost model
+  xgb_model <- xgboost(
+    data = X_train,
+    label = y_train,
+    nrounds = 100,
+    eta = 0.05,
+    max_depth = 4,
+    verbose = 0
+  )
+  
+  # Predict
+  pred_test <- predict(xgb_model, X_test)
+  
+  # Calculate metrics
+  ss_res <- sum((y_test - pred_test)^2)
+  ss_tot <- sum((y_test - mean(y_test))^2)
+  r2 <- 1 - ss_res / ss_tot
+  rmse <- sqrt(mean((y_test - pred_test)^2))
+  mae <- mean(abs(y_test - pred_test))
+  
+  # Store results
+  walk_forward_results[[fold]] <- data.frame(
+    fold = fold,
+    train_start = train_start_date,
+    train_end = train_end_date,
+    test_start = test_start_date,
+    test_end = test_end_date,
+    n_train = nrow(train_fold),
+    n_test = nrow(test_fold),
+    r2 = r2,
+    rmse = rmse,
+    mae = mae
+  )
+  
+  # Store predictions for later analysis
+  test_fold$predicted <- pred_test
+  test_fold$fold <- fold
+  
+  cat(sprintf("Fold %d: Train %s to %s | Test %s to %s | R² = %.4f | RMSE = %.4f\n",
+              fold, train_start_date, train_end_date, 
+              test_start_date, test_end_date, r2, rmse))
+  
+  fold <- fold + 1
+}
+
+```
+
+```{r}
+cv_summary <- bind_rows(walk_forward_results)
+
+cat("\n=== WALK-FORWARD CV SUMMARY ===\n")
+cat("Number of folds:", nrow(cv_summary), "\n")
+cat("Mean R²:   ", round(mean(cv_summary$r2, na.rm = TRUE), 4), "\n")
+cat("Median R²: ", round(median(cv_summary$r2, na.rm = TRUE), 4), "\n")
+cat("SD R²:     ", round(sd(cv_summary$r2, na.rm = TRUE), 4), "\n")
+cat("Min R²:    ", round(min(cv_summary$r2, na.rm = TRUE), 4), "\n")
+cat("Max R²:    ", round(max(cv_summary$r2, na.rm = TRUE), 4), "\n\n")
+
+cat("Mean RMSE: ", round(mean(cv_summary$rmse, na.rm = TRUE), 4), "\n")
+cat("Mean MAE:  ", round(mean(cv_summary$mae, na.rm = TRUE), 4), "\n")
+```
+
+```{r}
+library(ggplot2)
+
+# Plot 1: R² over time
+p1 <- ggplot(cv_summary, aes(x = test_start, y = r2)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = mean(cv_summary$r2, na.rm = TRUE), 
+             linetype = "dashed", color = "red") +
+  labs(title = "Model Performance Over Time (Walk-Forward CV)",
+       subtitle = paste0("Mean R² = ", round(mean(cv_summary$r2, na.rm = TRUE), 4)),
+       x = "Test Period Start",
+       y = "R²") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p1)
+
+# Plot 2: RMSE over time
+p2 <- ggplot(cv_summary, aes(x = test_start, y = rmse)) +
+  geom_line(color = "darkgreen", size = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = mean(cv_summary$rmse, na.rm = TRUE), 
+             linetype = "dashed", color = "red") +
+  labs(title = "RMSE Over Time",
+       x = "Test Period Start",
+       y = "RMSE") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p2)
+
+# Plot 3: Distribution of R²
+p3 <- ggplot(cv_summary, aes(x = r2)) +
+  geom_histogram(bins = 20, fill = "steelblue", alpha = 0.7) +
+  geom_vline(xintercept = mean(cv_summary$r2, na.rm = TRUE), 
+             color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Distribution of R² Across Folds",
+       x = "R²",
+       y = "Count") +
+  theme_minimal()
+
+print(p3)
+
+# ============================================================================
+# IDENTIFY BEST AND WORST PERIODS
+# ============================================================================
+
+cat("\n=== BEST PERFORMING PERIODS ===\n")
+best_periods <- cv_summary %>% 
+  arrange(desc(r2)) %>% 
+  head(3)
+print(best_periods %>% select(fold, test_start, test_end, r2, rmse))
+
+cat("\n=== WORST PERFORMING PERIODS ===\n")
+worst_periods <- cv_summary %>% 
+  arrange(r2) %>% 
+  head(3)
+print(worst_periods %>% select(fold, test_start, test_end, r2, rmse))
+
+```
+Model Save to be loaded 
+```{r}
+# Plot predictions vs actuals over entire period
+X_all <- as.matrix(model_data[, features])
+y_all <- model_data$price
+
+xgb_final <- xgboost(
+  data = X_all,
+  label = y_all,
+  nrounds = 100,
+  eta = 0.05,
+  max_depth = 4,
+  verbose = 0
+)
+
+predictions_all <- predict(xgb_final, X_all)
+
+plot_df <- data.frame(
+  date = model_data$date,
+  actual = model_data$price,
+  predicted = predictions_all
+)
+
+ggplot(plot_df, aes(x = date)) +
+  geom_line(aes(y = actual, color = "Actual"), size = 0.8) +
+  geom_line(aes(y = predicted, color = "Predicted"), size = 0.8, alpha = 0.7) +
+  scale_color_manual(values = c("Actual" = "black", "Predicted" = "red")) +
+  labs(title = "XGBoost Predictions vs Actual Prices",
+       subtitle = paste0("R² = ", round(cor(plot_df$actual, plot_df$predicted)^2, 3)),
+       x = "Date",
+       y = "Price ($/gallon)",
+       color = "") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+ggplot(plot_df, aes(x = predicted, y = actual)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual Scatter",
+       x = "Predicted Price",
+       y = "Actual Price") +
+  theme_minimal()
+```
+```{r}
+# Save final model and data for Shiny app
+dir.create("models", showWarnings = FALSE)
+dir.create("data", showWarnings = FALSE)
+
+# 1. Save the final trained model
+xgb.save(xgb_final, "models/xgb_gasoline_price.model")
+
+# 2. Save latest market state (most recent row)
+latest_idx <- nrow(model_data)
+latest_market_state <- list(
+  price = model_data$price[latest_idx],
+  price_lag1 = model_data$price_lag1[latest_idx],
+  price_lag3 = model_data$price_lag3[latest_idx],
+  price_lag7 = model_data$price_lag7[latest_idx],
+  crude_stocks = model_data$crude_stocks[latest_idx],
+  gas_stocks = model_data$gas_stocks[latest_idx],
+  distillate_stocks = model_data$distilate_stock[latest_idx],
+  gas_lag7 = model_data$gas_lag7[latest_idx],
+  crude_lag7 = model_data$crude_lag7[latest_idx],
+  distillate_lag7 = model_data$distillate_lag7[latest_idx],
+  temp_avg_lag1 = model_data$temp_avg_lag1[latest_idx],
+  temp_avg_lag7 = model_data$temp_avg_lag7[latest_idx],
+  temp_max_lag1 = model_data$temp_max_lag1[latest_idx],
+  temp_min_lag1 = model_data$temp_min_lag1[latest_idx],
+  month = as.numeric(model_data$month[latest_idx]),
+  is_summer = model_data$is_summer[latest_idx],
+  is_hurricane = model_data$is_hurricane[latest_idx],
+  date = model_data$date[latest_idx],
+  year = model_data$year[latest_idx]
+)
+saveRDS(latest_market_state, "data/latest_market_state.rds")
+
+# 3. Calculate historical volatility from CV results
+historical_sd <- mean(cv_summary$rmse, na.rm = TRUE)
+saveRDS(historical_sd, "data/historical_volatility.rds")
+
+# 4. Save model metadata
+importance_matrix <- xgb.importance(model = xgb_final)
+model_metadata <- list(
+  features = features,
+  feature_importance = importance_matrix,
+  training_date = Sys.Date(),
+  cv_summary = cv_summary,
+  mean_r2 = mean(cv_summary$r2, na.rm = TRUE),
+  mean_rmse = mean(cv_summary$rmse, na.rm = TRUE)
+)
+saveRDS(model_metadata, "models/model_metadata.rds")
+```
+
+
+
+```{r}
+# Test: Does your model create stable or explosive paths?
+test_scenario <- list(
+  crude_weekly_change = 0,
+  gas_weekly_change = 0,
+  distillate_weekly_change = 0,
+  weather = "normal",
+  stock_volatility = 0  # Remove stock noise
+)
+
+# Simulate 100 paths with NO scenario changes
+set.seed(123)
+test_paths <- matrix(NA, 100, 30)
+
+for (sim in 1:100) {
+  current_price <- latest_market_state$price
+  current_features <- latest_market_state
+  
+  for (day in 1:30) {
+    # Predict
+    X <- as.matrix(t(unlist(current_features[features])))
+    pred <- predict(xgb_final, X)
+    
+    # Add noise only
+    actual <- pred + rnorm(1, 0, historical_sd)
+    test_paths[sim, day] <- actual
+    
+    # Update lags
+    current_features$price_lag7 <- current_features$price_lag3
+    current_features$price_lag3 <- current_features$price_lag1
+    current_features$price_lag1 <- actual
+  }
+}
+
+# Plot results
+matplot(t(test_paths), type='l', col=rgb(0,0,1,0.1), 
+        main="XGBoost Paths Without Scenarios (Pure Model + Noise)",
+        xlab="Days", ylab="Price")
+abline(h=latest_market_state$price, col='red', lwd=2)
+
+# Check final distribution
+final_prices <- test_paths[, 30]
+cat("Starting price:", latest_market_state$price, "\n")
+cat("Day 30 median:", median(final_prices), "\n")
+cat("Day 30 range:", range(final_prices), "\n")
+cat("Exploded?", max(final_prices) > 2 * latest_market_state$price, "\n")
+```
+
+
+
